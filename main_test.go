@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 )
@@ -137,6 +141,97 @@ func TestQueryServerWithChallenge(t *testing.T) {
 	}
 	if s.Port == 0 {
 		t.Errorf("Port not parsed")
+	}
+}
+
+func TestParseServerList(t *testing.T) {
+	body := []byte(`{
+	  "response": {
+	    "servers": [
+	      {"addr":"1.2.3.4:27016","gameport":27016,"name":"DayZ One","map":"chernarusplus","players":40,"max_players":60,"bots":0,"version":"1.26.158020"},
+	      {"addr":"5.6.7.8:2302","gameport":2302,"name":"DayZ Two","map":"enoch","players":300,"max_players":127,"bots":2,"version":"1.26"},
+	      {"addr":"bogus-no-port","name":"skip me"}
+	    ]
+	  }
+	}`)
+
+	servers, err := parseServerList(body)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if len(servers) != 2 {
+		t.Fatalf("len = %d, want 2 (bad addr should be skipped)", len(servers))
+	}
+
+	if servers[0].IP != "1.2.3.4" || servers[0].Port != 27016 {
+		t.Errorf("server0 addr = %s:%d, want 1.2.3.4:27016", servers[0].IP, servers[0].Port)
+	}
+	if servers[0].Name != "DayZ One" || servers[0].Map != "chernarusplus" {
+		t.Errorf("server0 name/map = %q/%q", servers[0].Name, servers[0].Map)
+	}
+	if servers[0].Players != 40 || servers[0].MaxPlayers != 60 {
+		t.Errorf("server0 players = %d/%d, want 40/60", servers[0].Players, servers[0].MaxPlayers)
+	}
+
+	// players=300 must clamp into uint8 without wrapping.
+	if servers[1].Players != 255 {
+		t.Errorf("server1 players = %d, want clamped 255", servers[1].Players)
+	}
+}
+
+func TestFetchViaWebAPI(t *testing.T) {
+	var gotQuery url.Values
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotQuery = r.URL.Query()
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"response":{"servers":[
+			{"addr":"9.9.9.9:27016","name":"Live","map":"chernarusplus","players":10,"max_players":60,"version":"1.26"}
+		]}}`)
+	}))
+	defer srv.Close()
+
+	old := WEB_API_URL
+	WEB_API_URL = srv.URL
+	defer func() { WEB_API_URL = old }()
+
+	servers, err := FetchViaWebAPI("dummy-key")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(servers) != 1 || servers[0].IP != "9.9.9.9" || servers[0].Port != 27016 {
+		t.Fatalf("unexpected servers: %+v", servers)
+	}
+	if gotQuery.Get("key") != "dummy-key" {
+		t.Errorf("key param = %q", gotQuery.Get("key"))
+	}
+	if gotQuery.Get("filter") != "\\appid\\221100" {
+		t.Errorf("filter param = %q", gotQuery.Get("filter"))
+	}
+}
+
+func TestFetchViaWebAPIError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		fmt.Fprint(w, "Access is denied")
+	}))
+	defer srv.Close()
+
+	old := WEB_API_URL
+	WEB_API_URL = srv.URL
+	defer func() { WEB_API_URL = old }()
+
+	if _, err := FetchViaWebAPI("bad-key"); err == nil {
+		t.Fatal("expected error on non-200 response")
+	}
+}
+
+func TestClampU8(t *testing.T) {
+	cases := map[int]uint8{-5: 0, 0: 0, 100: 100, 255: 255, 300: 255}
+	for in, want := range cases {
+		if got := clampU8(in); got != want {
+			t.Errorf("clampU8(%d) = %d, want %d", in, got, want)
+		}
 	}
 }
 

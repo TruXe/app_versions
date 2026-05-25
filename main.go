@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -15,9 +20,14 @@ const (
 	MASTER_HOST = "hl2master.steampowered.com:27011"
 	APP_ID      = "221100" // DayZ
 
-	WORKERS = 500
-	TIMEOUT = 3 * time.Second
+	WORKERS   = 500
+	TIMEOUT   = 3 * time.Second
+	API_LIMIT = 20000 // Steam Web API hard cap per request
+	OUTPUT    = "servers.json"
 )
+
+// Overridable in tests.
+var WEB_API_URL = "https://api.steampowered.com/IGameServersService/GetServerList/v1/"
 
 type Server struct {
 	IP         string `json:"ip"`
@@ -38,19 +48,136 @@ var (
 )
 
 func main() {
-	fmt.Println("Fetching DayZ servers from Steam master...")
+	key := flag.String("key", os.Getenv("STEAM_API_KEY"), "Steam Web API key (enables GetServerList mode)")
+	flag.Parse()
 
-	servers, err := FetchMasterServers()
+	var (
+		servers []Server
+		err     error
+	)
+
+	if *key != "" {
+		fmt.Println("Fetching DayZ servers via Steam Web API...")
+		servers, err = FetchViaWebAPI(*key)
+	} else {
+		fmt.Println("No API key set (-key / STEAM_API_KEY); falling back to UDP master + A2S query...")
+		servers, err = ScrapeViaMaster()
+	}
+
 	if err != nil {
 		panic(err)
 	}
 
-	fmt.Printf("Found %d servers\n", len(servers))
+	fmt.Printf("Servers: %d\n", len(servers))
+
+	data, _ := json.MarshalIndent(servers, "", "  ")
+	if err := os.WriteFile(OUTPUT, data, 0644); err != nil {
+		panic(err)
+	}
+
+	fmt.Printf("Saved %s\n", OUTPUT)
+}
+
+// --- Steam Web API mode (GetServerList) ---------------------------------
+
+type apiResponse struct {
+	Response struct {
+		Servers []apiServer `json:"servers"`
+	} `json:"response"`
+}
+
+type apiServer struct {
+	Addr       string `json:"addr"`
+	Gameport   int    `json:"gameport"`
+	Name       string `json:"name"`
+	Map        string `json:"map"`
+	Players    int    `json:"players"`
+	MaxPlayers int    `json:"max_players"`
+	Bots       int    `json:"bots"`
+	Version    string `json:"version"`
+}
+
+func FetchViaWebAPI(key string) ([]Server, error) {
+	params := url.Values{}
+	params.Set("key", key)
+	params.Set("filter", "\\appid\\"+APP_ID)
+	params.Set("limit", fmt.Sprintf("%d", API_LIMIT))
+
+	client := &http.Client{Timeout: 30 * time.Second}
+
+	resp, err := client.Get(WEB_API_URL + "?" + params.Encode())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("steam api returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	return parseServerList(body)
+}
+
+func parseServerList(body []byte) ([]Server, error) {
+	var out apiResponse
+	if err := json.Unmarshal(body, &out); err != nil {
+		return nil, err
+	}
+
+	servers := make([]Server, 0, len(out.Response.Servers))
+
+	for _, s := range out.Response.Servers {
+		host, portStr, err := net.SplitHostPort(s.Addr)
+		if err != nil {
+			continue
+		}
+
+		var port uint16
+		fmt.Sscanf(portStr, "%d", &port)
+
+		servers = append(servers, Server{
+			IP:         host,
+			Port:       port,
+			Name:       s.Name,
+			Map:        s.Map,
+			Players:    clampU8(s.Players),
+			MaxPlayers: clampU8(s.MaxPlayers),
+			Bots:       clampU8(s.Bots),
+			Version:    s.Version,
+		})
+	}
+
+	return servers, nil
+}
+
+func clampU8(v int) uint8 {
+	if v < 0 {
+		return 0
+	}
+	if v > 255 {
+		return 255
+	}
+	return uint8(v)
+}
+
+// --- UDP master + A2S fallback mode -------------------------------------
+
+func ScrapeViaMaster() ([]Server, error) {
+	servers, err := FetchMasterServers()
+	if err != nil {
+		return nil, err
+	}
+
+	fmt.Printf("Found %d servers, querying...\n", len(servers))
 
 	serverChan := make(chan string, len(servers))
 
 	wg := sync.WaitGroup{}
-
 	for i := 0; i < WORKERS; i++ {
 		wg.Add(1)
 		go worker(serverChan, &wg)
@@ -63,15 +190,7 @@ func main() {
 
 	wg.Wait()
 
-	fmt.Printf("Online servers: %d\n", len(results))
-
-	data, _ := json.MarshalIndent(results, "", "  ")
-
-	if err := os.WriteFile("servers.json", data, 0644); err != nil {
-		panic(err)
-	}
-
-	fmt.Println("Saved servers.json")
+	return results, nil
 }
 
 func worker(ch <-chan string, wg *sync.WaitGroup) {
